@@ -1,0 +1,15 @@
+numpy<2.0
+scipy
+scikit-learn
+opencv-python
+opencv-contrib-python>=4.8.0.76
+matplotlib
+huggingface_hub
+decord
+torch>=2.0.0
+torchvision
+pillow
+"git+https://github.com/facebookresearch/sam3.git"
+# Note: SAM3 must be installed from git. 
+# You can run this command manually or let pip handle it if git is available:
+# pip install git+https://github.com/facebookresearch/sam3.git
