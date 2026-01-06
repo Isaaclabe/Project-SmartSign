@@ -3,12 +3,13 @@ import cv2
 import torch
 import numpy as np
 import threading
+import requests
+import shutil
 from PIL import Image
-from typing import List
+from typing import List, Optional
 from huggingface_hub import login
 
 # SAM3 Imports
-# Note: Ensure 'sam3' is installed via the git command in requirements
 try:
     import sam3
     from sam3 import build_sam3_image_model
@@ -33,19 +34,62 @@ class SAM3SignDetector:
         
         self._initialize_model()
 
+    def _download_bpe_file(self, dest_path: str):
+        """Downloads the missing BPE file from the SAM3 repository."""
+        url = "https://github.com/facebookresearch/sam3/raw/main/assets/bpe_simple_vocab_16e6.txt.gz"
+        print(f"Downloading BPE file from {url} to {dest_path}...")
+        
+        try:
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            with open(dest_path, 'wb') as f:
+                shutil.copyfileobj(response.raw, f)
+            print("Download complete.")
+        except Exception as e:
+            print(f"Failed to download BPE file: {e}")
+            raise RuntimeError("Could not acquire BPE file needed for SAM3 text prompts.")
+
     def _initialize_model(self):
         """Initializes the SAM3 model. Protected by lock during inference, but init happens once."""
         print(f"Initializing SAM3 on {self.device}...")
         
+        # 1. AUTHENTICATION
         try:
+            print(f"Attempting HuggingFace Login...")
             login(token=self.hf_token)
         except Exception as e:
-            print(f"Warning: HuggingFace Login failed. Models might not download if private. Error: {e}")
+            print("----------------------------------------------------------------")
+            print("CRITICAL AUTH ERROR: HuggingFace Login failed.")
+            print(f"Error details: {e}")
+            print("Please ensure your HF_TOKEN is valid and you have accepted the license")
+            print("for 'facebook/sam3' at https://huggingface.co/facebook/sam3")
+            print("----------------------------------------------------------------")
+            raise
 
-        # Define SAM3 Root to find assets (heuristic based on user snippet)
-        sam3_root = os.path.join(os.path.dirname(sam3.__file__), "..")
-        bpe_path = os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz")
+        # 2. LOCATE/DOWNLOAD BPE ASSETS
+        sam3_root = os.path.dirname(sam3.__file__)
+        possible_paths = [
+            os.path.join(sam3_root, "..", "assets", "bpe_simple_vocab_16e6.txt.gz"), # Git clone style
+            os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz"),       # Pkg style
+            os.path.join(os.getcwd(), "assets", "bpe_simple_vocab_16e6.txt.gz")      # Local fallback
+        ]
+        
+        bpe_path = None
+        for p in possible_paths:
+            if os.path.exists(p):
+                bpe_path = p
+                break
+        
+        if bpe_path is None:
+            print("BPE asset not found in package. Downloading to local ./assets folder...")
+            local_asset_path = os.path.join(os.getcwd(), "assets", "bpe_simple_vocab_16e6.txt.gz")
+            self._download_bpe_file(local_asset_path)
+            bpe_path = local_asset_path
 
+        print(f"Using BPE path: {bpe_path}")
+
+        # 3. BUILD MODEL
         # Optimization settings
         if self.device == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -53,9 +97,9 @@ class SAM3SignDetector:
 
         try:
             self.model = build_sam3_image_model(bpe_path=bpe_path)
-        except Exception:
-            print("Warning: Could not locate BPE file at derived path. Trying default build...")
-            self.model = build_sam3_image_model()
+        except Exception as e:
+            print(f"Error building SAM3 model: {e}")
+            raise
 
         self.model.to(self.device)
         self.processor = Sam3Processor(self.model, confidence_threshold=0.5)
@@ -66,6 +110,9 @@ class SAM3SignDetector:
         Runs SAM3 inference on the image.
         Returns a list of binary masks (numpy arrays of shape (H, W)).
         """
+        if self.model is None:
+            return []
+
         # Convert OpenCV BGR to PIL RGB
         pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         
@@ -83,26 +130,18 @@ class SAM3SignDetector:
                     self.processor.reset_all_prompts(inference_state)
                     
                     # 3. Apply Text Prompt
-                    # Note: inference_state is updated in place or returned
                     inference_state = self.processor.set_text_prompt(
                         state=inference_state, 
                         prompt=self.text_prompt
                     )
                     
                     # 4. Extract Masks
-                    # SAM3 'inference_state' usually contains the prediction results after prompting.
-                    # We need to parse the specific structure of inference_state to get masks.
-                    # Based on SAM3 internals: usually 'pred_masks' key holds the tensor.
-                    
                     masks_tensor = None
                     if hasattr(inference_state, 'pred_masks'):
                          masks_tensor = inference_state.pred_masks
                     elif isinstance(inference_state, dict) and 'pred_masks' in inference_state:
                          masks_tensor = inference_state['pred_masks']
                     else:
-                        # Fallback: inspect the object if structure is unknown (debugging)
-                        # Assuming typical SAM output format: (Batch, N, H, W)
-                        print("Warning: Could not find 'pred_masks' directly. Checking 'masks'...")
                         if 'masks' in inference_state:
                              masks_tensor = inference_state['masks']
 
@@ -110,7 +149,6 @@ class SAM3SignDetector:
                         return []
 
                     # Process Masks: Tensor -> List of Numpy Arrays
-                    # Masks are usually bool or float logits. We need uint8 binary (0, 1).
                     output_masks = []
                     
                     # Ensure we are on CPU and numpy
@@ -120,20 +158,17 @@ class SAM3SignDetector:
                         masks_np = masks_tensor
 
                     # Iterate over detected objects
-                    # Shape is likely (N_objects, 1, H, W) or (N_objects, H, W)
                     for m in masks_np:
                         # Remove channel dim if present (1, H, W) -> (H, W)
                         if m.ndim == 3 and m.shape[0] == 1:
                             m = m.squeeze(0)
                         
-                        # Threshold if logits (unlikely for final output, but safety check)
-                        # Usually SAM returns boolean masks or 0.0-1.0 probabilities
                         if m.dtype != bool and m.max() > 1.0: 
                             binary_mask = (m > 0).astype(np.uint8) # Logits
                         else:
                             binary_mask = m.astype(np.uint8)
 
-                        # Resize if mask resolution differs from original image (SAM sometimes predicts at low res)
+                        # Resize if mask resolution differs
                         h_orig, w_orig = image.shape[:2]
                         if binary_mask.shape != (h_orig, w_orig):
                             binary_mask = cv2.resize(binary_mask, (w_orig, h_orig), interpolation=cv2.INTER_NEAREST)
