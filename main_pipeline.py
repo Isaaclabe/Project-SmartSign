@@ -2,6 +2,7 @@ import os
 import cv2
 import numpy as np
 import logging
+import glob
 from concurrent.futures import ThreadPoolExecutor
 
 # Import modules
@@ -15,20 +16,30 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-HF_TOKEN = "your-token"  # Your Token
+# Replace with your valid token
+HF_TOKEN = "your-token" 
 TEXT_PROMPT = "sign"
-WORK_DIR = "./data"
+WORK_DIR = "/content/Project-SmartSign/data" # Expects user to provide this folder
 # ---------------------
 
 class PipelineProcessor:
     def __init__(self, base_dir: str):
         self.base_dir = base_dir
+        
+        # Verify Base Directory
+        if not os.path.exists(self.base_dir):
+            raise FileNotFoundError(f"The Input Directory '{self.base_dir}' does not exist. Please create it and add your 'faceX' and 'signfaceX' folders.")
+
         self.stitcher = ImageStitcher()
         self.aligner = ImageAligner()
         
         # Initialize SAM3 Detector (This will take time to load weights)
         logger.info("Initializing SAM3 Detector...")
-        self.detector = SAM3SignDetector(hf_token=HF_TOKEN, text_prompt=TEXT_PROMPT)
+        try:
+            self.detector = SAM3SignDetector(hf_token=HF_TOKEN, text_prompt=TEXT_PROMPT)
+        except Exception as e:
+            logger.error("Failed to initialize SAM3 Detector. Please check your HF_TOKEN and Internet Connection.")
+            raise e
 
     def process_single_group(self, face_idx: int):
         """
@@ -41,9 +52,13 @@ class PipelineProcessor:
         logger.info(f"--- Processing Group {face_idx} ---")
 
         # 1. Load Images
+        if not os.path.exists(face_folder):
+            logger.warning(f"Folder not found: {face_folder}. Skipping group {face_idx}.")
+            return
+
         face_images = ImageUtils.load_images_from_folder(face_folder)
         if not face_images:
-            logger.info(f"Skipping face{face_idx} (empty or not found).")
+            logger.warning(f"No images found in {face_folder}. Skipping group {face_idx}.")
             return
 
         # 2. Logic: One image vs Many images (Stitching)
@@ -75,7 +90,11 @@ class PipelineProcessor:
                 logger.info(f"Group {face_idx}: Mask {i} is fragmented (occluded). Attempting recovery via wrap-process.")
                 
                 if signface_images is None:
-                    signface_images = ImageUtils.load_images_from_folder(signface_folder)
+                    if os.path.exists(signface_folder):
+                        signface_images = ImageUtils.load_images_from_folder(signface_folder)
+                    else:
+                        signface_images = []
+                        logger.warning(f"Group {face_idx}: Signface folder not found, cannot perform recovery.")
 
                 replaced = False
                 
@@ -86,11 +105,6 @@ class PipelineProcessor:
                     
                     if warped_img is not None:
                         # 6. Check Overlap
-                        # Create a bounding box of the fragmented mask in the main image
-                        # y_indices, x_indices = np.where(mask > 0) # mask is already numpy uint8
-                        
-                        # Basic overlap check: Does the warped image cover the fragmented region?
-                        # Since warped_img is full size (black where no data), we check non-zero pixels
                         warped_gray = cv2.cvtColor(warped_img, cv2.COLOR_BGR2GRAY)
                         _, warped_mask = cv2.threshold(warped_gray, 1, 1, cv2.THRESH_BINARY)
                         
@@ -106,8 +120,6 @@ class PipelineProcessor:
                             # Run detection on the warped clean image
                             new_masks = self.detector.detect_segmentation(warped_img)
                             
-                            # Find the specific mask in the new results that corresponds to our location
-                            # (Heuristic: Find mask with highest IoU with original fragmented mask)
                             best_candidate = None
                             best_iou = 0
                             
@@ -126,10 +138,9 @@ class PipelineProcessor:
                                 final_masks.append(best_candidate)
                                 replaced = True
                                 logger.info(f"Group {face_idx}: Fragmented mask replaced with clean mask.")
-                                break # Stop looking through signface images
+                                break 
                 
                 if not replaced:
-                    logger.warning(f"Group {face_idx}: Could not fix fragmentation. Keeping original.")
                     final_masks.append(mask)
             else:
                 final_masks.append(mask)
@@ -140,25 +151,23 @@ class PipelineProcessor:
 
     def run(self):
         """
-        Runs the pipeline for all 4 faces in parallel.
+        Runs the pipeline for faces 1 to 8.
         """
-        # We have face1 to face4
-        indices = [1, 2, 3, 4] 
+        # We have face1 to face8
+        indices = [1, 2, 3, 4, 5, 6, 7, 8]
         
         # Parallel Execution for Optimization
-        # Note: While loading/stitching is parallel, SAM3 inference is locked sequentially
         with ThreadPoolExecutor(max_workers=4) as executor:
             executor.map(self.process_single_group, indices)
 
 if __name__ == "__main__":
-    # Ensure this directory exists or change to your inputs
-    
-    # Create dummy directories for demonstration if they don't exist
-    for i in range(1, 5):
-        os.makedirs(os.path.join(WORK_DIR, f"face{i}"), exist_ok=True)
-        os.makedirs(os.path.join(WORK_DIR, f"signface{i}"), exist_ok=True)
-        
     print(f"Starting pipeline in {WORK_DIR}...")
-    processor = PipelineProcessor(WORK_DIR)
-    processor.run()
-    print("Pipeline finished.")
+    
+    # Check if user provided data
+    if not os.path.exists(WORK_DIR):
+        print(f"ERROR: The directory '{WORK_DIR}' does not exist.")
+        print("Please create it and add your 'face1', 'face2', ... folders before running.")
+    else:
+        processor = PipelineProcessor(WORK_DIR)
+        processor.run()
+        print("Pipeline finished.")
