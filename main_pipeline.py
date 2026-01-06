@@ -8,18 +8,27 @@ from concurrent.futures import ThreadPoolExecutor
 from utils import ImageUtils
 from stitcher import ImageStitcher
 from aligner import ImageAligner
-from detector import MockSignDetector
+from detector import SAM3SignDetector
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- CONFIGURATION ---
+HF_TOKEN = "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"  # Your Token
+TEXT_PROMPT = "sign"
+WORK_DIR = "./data"
+# ---------------------
+
 class PipelineProcessor:
     def __init__(self, base_dir: str):
         self.base_dir = base_dir
         self.stitcher = ImageStitcher()
-        self.detector = MockSignDetector()
         self.aligner = ImageAligner()
+        
+        # Initialize SAM3 Detector (This will take time to load weights)
+        logger.info("Initializing SAM3 Detector...")
+        self.detector = SAM3SignDetector(hf_token=HF_TOKEN, text_prompt=TEXT_PROMPT)
 
     def process_single_group(self, face_idx: int):
         """
@@ -50,8 +59,11 @@ class PipelineProcessor:
             logger.error(f"Group {face_idx}: Failed to produce a main image.")
             return
 
-        # 3. Sign Detection (Segmentation)
+        # 3. Sign Detection (Segmentation) using SAM3
+        logger.info(f"Group {face_idx}: Running SAM3 inference...")
         detected_masks = self.detector.detect_segmentation(main_image)
+        logger.info(f"Group {face_idx}: Detected {len(detected_masks)} objects.")
+        
         final_masks = []
 
         # Load signface images only if needed (Lazy loading for optimization)
@@ -75,8 +87,7 @@ class PipelineProcessor:
                     if warped_img is not None:
                         # 6. Check Overlap
                         # Create a bounding box of the fragmented mask in the main image
-                        y_indices, x_indices = np.where(mask > 0)
-                        if len(x_indices) == 0: continue
+                        # y_indices, x_indices = np.where(mask > 0) # mask is already numpy uint8
                         
                         # Basic overlap check: Does the warped image cover the fragmented region?
                         # Since warped_img is full size (black where no data), we check non-zero pixels
@@ -129,19 +140,18 @@ class PipelineProcessor:
 
     def run(self):
         """
-        Runs the pipeline for all 8 faces in parallel.
+        Runs the pipeline for all 4 faces in parallel.
         """
-        # We have face1 to face8. Actually requirement said 4, but user listed "face4" in text and then asked for logic generic.
-        # Adjusted to requirement: "face1...face4"
+        # We have face1 to face4
         indices = [1, 2, 3, 4] 
         
         # Parallel Execution for Optimization
+        # Note: While loading/stitching is parallel, SAM3 inference is locked sequentially
         with ThreadPoolExecutor(max_workers=4) as executor:
             executor.map(self.process_single_group, indices)
 
 if __name__ == "__main__":
     # Ensure this directory exists or change to your inputs
-    WORK_DIR = "./data"
     
     # Create dummy directories for demonstration if they don't exist
     for i in range(1, 5):
