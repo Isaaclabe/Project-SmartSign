@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
-HF_TOKEN = "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"  # Your Token
+HF_TOKEN = "your-token"  # Your Token
 TEXT_PROMPT = "sign"
 WORK_DIR = "./data"
 # ---------------------
