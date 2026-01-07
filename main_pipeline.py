@@ -17,29 +17,35 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 # Replace with your valid token
-HF_TOKEN = "your-token" 
+HF_TOKEN = "your_huggingface_token_here"
 TEXT_PROMPT = "sign"
-WORK_DIR = "/content/Project-SmartSign/data" # Expects user to provide this folder
+
+# List of folders to process
+DATA_FOLDERS = ["/content/Project-SmartSign/data1", "/content/Project-SmartSign/data2"]
 # ---------------------
 
 class PipelineProcessor:
-    def __init__(self, base_dir: str):
+    def __init__(self, base_dir: str, detector: SAM3SignDetector):
+        """
+        Initializes the processor for a specific directory.
+        :param base_dir: Path to the data folder (e.g., './data1')
+        :param detector: An existing, initialized instance of SAM3SignDetector
+        """
         self.base_dir = base_dir
-        
-        # Verify Base Directory
-        if not os.path.exists(self.base_dir):
-            raise FileNotFoundError(f"The Input Directory '{self.base_dir}' does not exist. Please create it and add your 'faceX' and 'signfaceX' folders.")
+        self.detector = detector  # Use the shared detector instance
 
         self.stitcher = ImageStitcher()
         self.aligner = ImageAligner()
         
-        # Initialize SAM3 Detector (This will take time to load weights)
-        logger.info("Initializing SAM3 Detector...")
-        try:
-            self.detector = SAM3SignDetector(hf_token=HF_TOKEN, text_prompt=TEXT_PROMPT)
-        except Exception as e:
-            logger.error("Failed to initialize SAM3 Detector. Please check your HF_TOKEN and Internet Connection.")
-            raise e
+        # Verify Base Directory
+        if not os.path.exists(self.base_dir):
+            logger.warning(
+                f"The Input Directory '{self.base_dir}' does not exist. "
+                "Skipping this folder."
+            )
+            self.valid = False
+        else:
+            self.valid = True
 
     def process_single_group(self, face_idx: int):
         """
@@ -49,7 +55,7 @@ class PipelineProcessor:
         signface_folder = os.path.join(self.base_dir, f"signface{face_idx}")
         output_folder = os.path.join(self.base_dir, f"face{face_idx}_signs")
 
-        logger.info(f"--- Processing Group {face_idx} ---")
+        logger.info(f"[{self.base_dir}] --- Processing Group {face_idx} ---")
 
         # 1. Load Images
         if not os.path.exists(face_folder):
@@ -65,36 +71,36 @@ class PipelineProcessor:
         main_image = None
         if len(face_images) == 1:
             main_image = face_images[0]
-            logger.info(f"Group {face_idx}: Single image selected.")
+            logger.info(f"[{self.base_dir}] Group {face_idx}: Single image selected.")
         else:
             main_image = self.stitcher.stitch(face_images)
-            logger.info(f"Group {face_idx}: Stitching completed.")
+            logger.info(f"[{self.base_dir}] Group {face_idx}: Stitching completed.")
 
         if main_image is None:
-            logger.error(f"Group {face_idx}: Failed to produce a main image.")
+            logger.error(f"[{self.base_dir}] Group {face_idx}: Failed to produce a main image.")
             return
 
         # 3. Sign Detection (Segmentation) using SAM3
-        logger.info(f"Group {face_idx}: Running SAM3 inference...")
+        logger.info(f"[{self.base_dir}] Group {face_idx}: Running SAM3 inference...")
         detected_masks = self.detector.detect_segmentation(main_image)
-        logger.info(f"Group {face_idx}: Detected {len(detected_masks)} objects.")
+        logger.info(f"[{self.base_dir}] Group {face_idx}: Detected {len(detected_masks)} objects.")
         
         final_masks = []
 
-        # Load signface images only if needed (Lazy loading for optimization)
+        # Load signface images only if needed (Lazy loading)
         signface_images = None 
 
         for i, mask in enumerate(detected_masks):
             # 4. Check Fragmentation (Occlusion)
             if self.detector.is_fragmented(mask):
-                logger.info(f"Group {face_idx}: Mask {i} is fragmented (occluded). Attempting recovery via wrap-process.")
+                logger.info(f"[{self.base_dir}] Group {face_idx}: Mask {i} is fragmented (occluded). Attempting recovery.")
                 
                 if signface_images is None:
                     if os.path.exists(signface_folder):
                         signface_images = ImageUtils.load_images_from_folder(signface_folder)
                     else:
                         signface_images = []
-                        logger.warning(f"Group {face_idx}: Signface folder not found, cannot perform recovery.")
+                        logger.warning(f"[{self.base_dir}] Group {face_idx}: Signface folder not found.")
 
                 replaced = False
                 
@@ -115,7 +121,7 @@ class PipelineProcessor:
                         
                         # If the warped image covers at least 50% of the fragmented area, proceed
                         if mask_count > 0 and (overlap_count / mask_count) > 0.5:
-                            logger.info(f"Group {face_idx}: Overlap found. Re-detecting on warped image.")
+                            logger.info(f"[{self.base_dir}] Group {face_idx}: Overlap found. Re-detecting on warped image.")
                             
                             # Run detection on the warped clean image
                             new_masks = self.detector.detect_segmentation(warped_img)
@@ -137,7 +143,7 @@ class PipelineProcessor:
                             if best_candidate is not None:
                                 final_masks.append(best_candidate)
                                 replaced = True
-                                logger.info(f"Group {face_idx}: Fragmented mask replaced with clean mask.")
+                                logger.info(f"[{self.base_dir}] Group {face_idx}: Fragmented mask replaced with clean mask.")
                                 break 
                 
                 if not replaced:
@@ -145,14 +151,16 @@ class PipelineProcessor:
             else:
                 final_masks.append(mask)
 
-        # 7. Save Results
+        # 7. Save Results (Utils will now save cropped PNGs based on previous update)
         ImageUtils.save_results(output_folder, main_image, final_masks)
-        logger.info(f"Group {face_idx}: Processing complete. Results saved to {output_folder}")
+        logger.info(f"[{self.base_dir}] Group {face_idx}: Processing complete. Results saved to {output_folder}")
 
     def run(self):
         """
         Runs the pipeline for faces 1 to 8.
         """
+        if not self.valid:
+            return
         # We have face1 to face8
         indices = [1, 2, 3, 4, 5, 6, 7, 8]
         
@@ -161,13 +169,30 @@ class PipelineProcessor:
             executor.map(self.process_single_group, indices)
 
 if __name__ == "__main__":
-    print(f"Starting pipeline in {WORK_DIR}...")
+    print("--- Starting Multi-Folder Pipeline ---")
     
-    # Check if user provided data
-    if not os.path.exists(WORK_DIR):
-        print(f"ERROR: The directory '{WORK_DIR}' does not exist.")
-        print("Please create it and add your 'face1', 'face2', ... folders before running.")
-    else:
-        processor = PipelineProcessor(WORK_DIR)
+    # 1. Initialize SAM3 Detector ONCE (Global)
+    # This prevents reloading the heavy model for each folder
+    logger.info("Initializing SAM3 Detector (Global Shared Instance)...")
+    try:
+        global_detector = SAM3SignDetector(hf_token=HF_TOKEN, text_prompt=TEXT_PROMPT)
+    except Exception as e:
+        logger.error("CRITICAL: Failed to initialize global detector.")
+        # We exit here because the pipeline cannot run without the model
+        raise e
+
+    # 2. Iterate through Data Folders
+    for folder_path in DATA_FOLDERS:
+        print(f"\n=================================================")
+        print(f" PROCESSING FOLDER: {folder_path}")
+        print(f"=================================================")
+        
+        if not os.path.exists(folder_path):
+            logger.warning(f"Folder '{folder_path}' not found. Skipping.")
+            continue
+            
+        # Create processor for this folder, passing the initialized detector
+        processor = PipelineProcessor(folder_path, detector=global_detector)
         processor.run()
-        print("Pipeline finished.")
+    
+    print("\nAll folders processed.")

@@ -74,3 +74,4 @@ class ImageUtils:
                 # Save
                 filename = os.path.join(output_folder, f"sign_crop_{idx}.png")
                 cv2.imwrite(filename, crop_png)
+
