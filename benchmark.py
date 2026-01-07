@@ -34,7 +34,7 @@ except ImportError:
 # ----------------------------
 # Token provided in your snippet
 # Read token from environment (never hard-code secrets in git)
-HF_TOKEN = os.getenv("HF_TOKEN", "your_huggingface_token_here")
+HF_TOKEN = "your_huggingface_token_here"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def find_result_image(base_folder, face_id="face1"):
