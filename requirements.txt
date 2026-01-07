@@ -20,6 +20,7 @@ accelerate
 google-generativeai
 pillow
 python-dotenv
+triton
 # Note: SAM3 must be installed from git. 
 # You can run this command manually or let pip handle it if git is available:
 # pip install git+https://github.com/facebookresearch/sam3.git

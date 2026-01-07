@@ -30,8 +30,9 @@ class ImageUtils:
     @staticmethod
     def save_results(output_folder: str, main_image: np.ndarray, masks: List[np.ndarray]):
         """
-        Saves the final stitched/selected reference image and the cropped sign segments.
-        The segments are saved as PNGs with transparent backgrounds.
+        Saves the final stitched/selected reference image and the sign segments.
+        The segments are saved as FULL-SIZE PNGs with transparent backgrounds.
+        The non-sign area is transparent, but the image dimensions remain equal to main_image.
         """
         if os.path.exists(output_folder):
             shutil.rmtree(output_folder)
@@ -40,38 +41,27 @@ class ImageUtils:
         # Save Main Reference Image
         cv2.imwrite(os.path.join(output_folder, "reference_image.jpg"), main_image)
 
-        # Save Cropped Segments
+        # Save Segments
         for idx, mask in enumerate(masks):
             # Ensure mask is uint8 binary
             mask_uint8 = mask.astype(np.uint8)
             
-            # Find bounding box of the mask
-            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
+            # Skip empty masks
+            if cv2.countNonZero(mask_uint8) == 0:
                 continue
                 
-            # Get the bounding box of the largest contour (or union of contours)
-            x, y, w, h = cv2.boundingRect(mask_uint8)
+            # Prepare Alpha Channel
+            # If mask is 0/1, scale to 0/255. If it's already 0/255, threshold ensures it.
+            # 255 (White) = Opaque (Keep Image), 0 (Black) = Transparent
+            _, alpha = cv2.threshold(mask_uint8, 0, 255, cv2.THRESH_BINARY)
             
-            if w > 0 and h > 0:
-                # 1. Crop the original image (BGR)
-                crop_bgr = main_image[y:y+h, x:x+w]
-                
-                # 2. Crop the mask
-                crop_mask = mask_uint8[y:y+h, x:x+w]
-                
-                # 3. Apply the mask to the image logic
-                # We want the background to be transparent.
-                # Create Alpha channel: 255 where mask is 1, 0 where mask is 0
-                alpha = (crop_mask * 255).astype(np.uint8)
-                
-                # Split BGR channels
-                b, g, r = cv2.split(crop_bgr)
-                
-                # Merge into BGRA (4 channels)
-                crop_png = cv2.merge([b, g, r, alpha])
-                
-                # Save
-                filename = os.path.join(output_folder, f"sign_crop_{idx}.png")
-                cv2.imwrite(filename, crop_png)
-
+            # Split BGR channels of the full-size image
+            b, g, r = cv2.split(main_image)
+            
+            # Merge into BGRA (4 channels)
+            # This preserves the full HxW dimensions of the original image
+            full_size_png = cv2.merge([b, g, r, alpha])
+            
+            # Save
+            filename = os.path.join(output_folder, f"sign_full_{idx}.png")
+            cv2.imwrite(filename, full_size_png)
