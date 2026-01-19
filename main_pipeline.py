@@ -21,7 +21,7 @@ HF_TOKEN = "your_huggingface_token_here"
 TEXT_PROMPT = "sign"
 
 # Root directory containing the store folders
-ROOT_DIR = "/content/Project-SmartSign/photo-2"
+ROOT_DIR = "/content/Project-SmartSign/data-image"
 # ---------------------
 
 class PipelineProcessor:
