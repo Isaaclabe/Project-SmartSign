@@ -6,7 +6,7 @@ import glob
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-# Import modules
+# Import modules (Assuming these files exist in your local directory)
 from utils import ImageUtils
 from stitcher import ImageStitcher
 from aligner import ImageAligner
@@ -20,18 +20,17 @@ logger = logging.getLogger(__name__)
 HF_TOKEN = "your_huggingface_token_here" 
 TEXT_PROMPT = "sign"
 
-# The FIRST folder in this list is treated as the REFERENCE.
-# Subsequent folders (data2, data3) will be warped to match data1.
-DATA_FOLDERS = ["/content/Project-SmartSign/data1", "/content/Project-SmartSign/data2"] 
+# Root directory containing the store folders
+ROOT_DIR = "/content/Project-SmartSign/photo-2"
 # ---------------------
 
 class PipelineProcessor:
     def __init__(self, base_dir: str, detector: SAM3SignDetector, reference_base_dir: Optional[str] = None):
         """
         Initializes the processor for a specific directory.
-        :param base_dir: Path to the current data folder (e.g., './data2')
+        :param base_dir: Path to the current data folder (e.g., './store1/data2')
         :param detector: Shared SAM3SignDetector instance
-        :param reference_base_dir: Path to the reference folder (e.g., './data1'). 
+        :param reference_base_dir: Path to the reference folder (e.g., './store1/data1'). 
                                    If provided, we try to align images to this reference.
         """
         self.base_dir = base_dir
@@ -82,7 +81,7 @@ class PipelineProcessor:
         # --- NEW STEP: ALIGNMENT TO REFERENCE ---
         if self.reference_base_dir:
             # Construct path to the reference image generated previously
-            # e.g., ./data1/face1_signs/reference_image.jpg
+            # e.g., .../store1/data1/face1_signs/reference_image.jpg
             ref_img_path = os.path.join(self.reference_base_dir, f"face{face_idx}_signs", "reference_image.jpg")
             
             if os.path.exists(ref_img_path):
@@ -101,7 +100,7 @@ class PipelineProcessor:
                 else:
                     logger.warning(f"[{self.base_dir}] Group {face_idx}: Could not load reference image.")
             else:
-                logger.info(f"[{self.base_dir}] Group {face_idx}: No reference image found (maybe face{face_idx} missing in data1). Skipping alignment.")
+                logger.info(f"[{self.base_dir}] Group {face_idx}: No reference image found (maybe face{face_idx} missing in reference dir). Skipping alignment.")
         # ----------------------------------------
 
         # 3. Sign Detection (Segmentation) using SAM3
@@ -173,7 +172,7 @@ class PipelineProcessor:
             executor.map(self.process_single_group, indices)
 
 if __name__ == "__main__":
-    print("--- Starting Multi-Folder Pipeline ---")
+    print("--- Starting Nested Multi-Folder Pipeline ---")
     
     logger.info("Initializing SAM3 Detector (Global)...")
     try:
@@ -182,27 +181,52 @@ if __name__ == "__main__":
         logger.error("CRITICAL: Failed to initialize global detector.")
         raise e
 
-    # Track the reference folder (the first one processed)
-    primary_ref_dir = None
+    if not os.path.exists(ROOT_DIR):
+        logger.error(f"Root directory {ROOT_DIR} does not exist!")
+        exit(1)
 
-    for i, folder_path in enumerate(DATA_FOLDERS):
-        print(f"\n=================================================")
-        print(f" PROCESSING FOLDER: {folder_path}")
-        print(f"=================================================")
-        
-        if not os.path.exists(folder_path):
-            logger.warning(f"Folder '{folder_path}' not found. Skipping.")
-            continue
-            
-        # If it's the first folder, it sets itself as reference.
-        # If it's the second/third, it uses primary_ref_dir.
-        if i == 0:
-            processor = PipelineProcessor(folder_path, detector=global_detector, reference_base_dir=None)
-            primary_ref_dir = folder_path # Set data1 as reference
-        else:
-            # Pass data1 as the reference base
-            processor = PipelineProcessor(folder_path, detector=global_detector, reference_base_dir=primary_ref_dir)
-            
-        processor.run()
+    # 1. Find all Store directories (e.g., photo-2/store1, photo-2/store2)
+    # pattern: ROOT_DIR/store*
+    store_paths = sorted(glob.glob(os.path.join(ROOT_DIR, "store*")))
     
-    print("\nAll folders processed.")
+    if not store_paths:
+        logger.warning(f"No 'store' folders found in {ROOT_DIR}")
+
+    # 2. Loop through each store
+    for store_path in store_paths:
+        store_name = os.path.basename(store_path)
+        print(f"\n#################################################")
+        print(f" PROCESSING STORE: {store_name}")
+        print(f"#################################################")
+
+        # 3. Find data folders inside this store (e.g., store1/data1, store1/data2)
+        data_paths = sorted(glob.glob(os.path.join(store_path, "data*")))
+        
+        if not data_paths:
+            logger.warning(f"No 'data' folders found in {store_name}. Skipping.")
+            continue
+
+        # Track the reference folder FOR THIS SPECIFIC STORE
+        # Usually the first folder (data1) is the reference for (data2, data3) within the same store
+        current_store_ref_dir = None
+
+        for i, data_folder in enumerate(data_paths):
+            folder_name = os.path.basename(data_folder)
+            print(f"\n   >>> Sub-folder: {folder_name}")
+            
+            # Logic:
+            # The first data folder found (e.g., data1) becomes the reference for this store.
+            # Subsequent folders (data2) align to the first one.
+            
+            if i == 0:
+                processor = PipelineProcessor(data_folder, detector=global_detector, reference_base_dir=None)
+                current_store_ref_dir = data_folder # Set data1 as reference for this store
+                logger.info(f"   [Reference set to: {folder_name}]")
+            else:
+                # Pass the store's data1 as the reference base
+                processor = PipelineProcessor(data_folder, detector=global_detector, reference_base_dir=current_store_ref_dir)
+                logger.info(f"   [Aligning to reference: {os.path.basename(current_store_ref_dir)}]")
+            
+            processor.run()
+    
+    print("\nAll stores processed.")
