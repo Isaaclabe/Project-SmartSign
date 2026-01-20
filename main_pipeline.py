@@ -1,232 +1,318 @@
 import os
 import cv2
-import numpy as np
-import logging
 import glob
+import logging
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import List, Dict, Tuple
 
-# Import modules (Assuming these files exist in your local directory)
+# Local imports
 from utils import ImageUtils
 from stitcher import ImageStitcher
 from aligner import ImageAligner
 from detector import SAM3SignDetector
+from vlm_processor import VLMProcessor
 
-# Configure Logging
+# --- CONFIGURATION ---
+HF_TOKEN = "your_huggingface_token_here"
+GOOGLE_API_KEY = "your_google_api_key_here"
+ROOT_DIR = "/content/Project-SmartSign/data-image"
+TEXT_PROMPT = "sign"
+IOU_THRESHOLD_PAIRING = 0.50
+# ---------------------
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- CONFIGURATION ---
-HF_TOKEN = "your_huggingface_token_here" 
-TEXT_PROMPT = "sign"
-
-# Root directory containing the store folders
-ROOT_DIR = "/content/Project-SmartSign/data-image"
-# ---------------------
-
-class PipelineProcessor:
-    def __init__(self, base_dir: str, detector: SAM3SignDetector, reference_base_dir: Optional[str] = None):
-        """
-        Initializes the processor for a specific directory.
-        :param base_dir: Path to the current data folder (e.g., './store1/data2')
-        :param detector: Shared SAM3SignDetector instance
-        :param reference_base_dir: Path to the reference folder (e.g., './store1/data1'). 
-                                   If provided, we try to align images to this reference.
-        """
-        self.base_dir = base_dir
-        self.reference_base_dir = reference_base_dir
-        self.detector = detector
-        
+class SignPipeline:
+    def __init__(self, root_dir: str):
+        self.root_dir = root_dir
         self.stitcher = ImageStitcher()
         self.aligner = ImageAligner()
         
-        # Verify Base Directory
-        if not os.path.exists(self.base_dir):
-            logger.error(f"The Input Directory '{self.base_dir}' does not exist.")
-            self.valid = False
-        else:
-            self.valid = True
+        # Initialize Detectors and VLM
+        try:
+            self.detector = SAM3SignDetector(hf_token=HF_TOKEN, text_prompt=TEXT_PROMPT)
+        except Exception as e:
+            logger.error(f"Failed to init SAM3: {e}")
+            raise e
 
-    def process_single_group(self, face_idx: int):
+        self.vlm = VLMProcessor(api_key=GOOGLE_API_KEY)
+
+    # =========================================================================
+    # STEP 1: Extract Signs from Face (Wide View)
+    # =========================================================================
+    def process_face_extraction(self, store_path: str, data_folder: str, face_idx: str):
         """
-        Main logic flow for a single index.
+        Stitches face images, detects signs, and returns the Main Image + Masks.
         """
-        face_folder = os.path.join(self.base_dir, f"face{face_idx}")
-        signface_folder = os.path.join(self.base_dir, f"signface{face_idx}")
-        output_folder = os.path.join(self.base_dir, f"face{face_idx}_signs")
+        face_path = os.path.join(store_path, data_folder, f"face{face_idx}")
+        if not os.path.exists(face_path):
+            return None, []
 
-        logger.info(f"[{self.base_dir}] --- Processing Group {face_idx} ---")
+        images = ImageUtils.load_images_from_folder(face_path)
+        if not images:
+            return None, []
 
-        # 1. Load Images
-        if not os.path.exists(face_folder):
-            return
-
-        face_images = ImageUtils.load_images_from_folder(face_folder)
-        if not face_images:
-            return
-
-        # 2. Stitching Logic
-        main_image = None
-        if len(face_images) == 1:
-            main_image = face_images[0]
-            logger.info(f"[{self.base_dir}] Group {face_idx}: Single image selected.")
+        # Stitch
+        if len(images) > 1:
+            main_image = self.stitcher.stitch(images)
         else:
-            main_image = self.stitcher.stitch(face_images)
-            logger.info(f"[{self.base_dir}] Group {face_idx}: Stitching completed.")
+            main_image = images[0]
 
         if main_image is None:
-            logger.error(f"[{self.base_dir}] Group {face_idx}: Failed to produce a main image.")
+            return None, []
+
+        # Detect
+        masks = self.detector.detect_segmentation(main_image)
+        return main_image, masks
+
+    # =========================================================================
+    # STEP 2: Extract Signs from Signface (Baseline/Close-up View)
+    # =========================================================================
+    def process_baseline_extraction(self, store_path: str, data_folder: str, face_idx: str):
+        """
+        Loads signface image (close-up), detects signs, and returns Image + Masks.
+        """
+        signface_path = os.path.join(store_path, data_folder, f"signface{face_idx}")
+        if not os.path.exists(signface_path):
+            return None, []
+
+        images = ImageUtils.load_images_from_folder(signface_path)
+        if not images:
+            return None, []
+        
+        # Usually signface is a single close-up, but stitch if needed
+        main_image = images[0] 
+        
+        # Detect
+        masks = self.detector.detect_segmentation(main_image)
+        return main_image, masks
+
+    # =========================================================================
+    # STEP 3 & 4 & 5: Filter, Pair, Merge
+    # =========================================================================
+    def run_store_pipeline(self, store_path: str):
+        store_name = os.path.basename(store_path)
+        logger.info(f"=== Processing Store: {store_name} ===")
+
+        # Identify data folders (data1, data2, ...)
+        data_folders = sorted([os.path.basename(p) for p in glob.glob(os.path.join(store_path, "data*"))])
+        if "data1" not in data_folders or "data2" not in data_folders:
+            logger.warning(f"Store {store_name} missing data1 or data2. Skipping pairing.")
             return
 
-        # --- NEW STEP: ALIGNMENT TO REFERENCE ---
-        if self.reference_base_dir:
-            # Construct path to the reference image generated previously
-            # e.g., .../store1/data1/face1_signs/reference_image.jpg
-            ref_img_path = os.path.join(self.reference_base_dir, f"face{face_idx}_signs", "reference_image.jpg")
-            
-            if os.path.exists(ref_img_path):
-                logger.info(f"[{self.base_dir}] Group {face_idx}: Found reference at {ref_img_path}. Attempting alignment...")
-                ref_img = cv2.imread(ref_img_path)
+        # Prepare storage for detected data per face
+        # Structure: detections[data_folder][face_idx] = {'image': img, 'masks': [m1, m2], 'baseline_masks': [bm1]}
+        detections = {d: {} for d in data_folders}
+
+        # --- A. DETECT & FILTER (Steps 1, 2, 3) ---
+        for data_name in data_folders:
+            # Create Output Directories
+            det_sign_dir = os.path.join(store_path, "detected_sign", data_name)
+            det_base_dir = os.path.join(store_path, "detected_baseline_sign", data_name)
+            ImageUtils.clear_and_create_dir(det_sign_dir)
+            ImageUtils.clear_and_create_dir(det_base_dir)
+
+            # Process Faces 1..8
+            for i in range(1, 9):
+                face_idx = str(i)
                 
-                if ref_img is not None:
-                    # Align current main_image (source) to ref_img (target)
-                    warped_img, _ = self.aligner.align_image(target_img=ref_img, source_img=main_image)
-                    
-                    if warped_img is not None:
-                        logger.info(f"[{self.base_dir}] Group {face_idx}: Alignment SUCCESS. Using warped image.")
-                        main_image = warped_img
-                    else:
-                        logger.warning(f"[{self.base_dir}] Group {face_idx}: Alignment FAILED (not enough matches). Using original perspective.")
-                else:
-                    logger.warning(f"[{self.base_dir}] Group {face_idx}: Could not load reference image.")
-            else:
-                logger.info(f"[{self.base_dir}] Group {face_idx}: No reference image found (maybe face{face_idx} missing in reference dir). Skipping alignment.")
-        # ----------------------------------------
-
-        # 3. Sign Detection (Segmentation) using SAM3
-        logger.info(f"[{self.base_dir}] Group {face_idx}: Running SAM3 inference...")
-        detected_masks = self.detector.detect_segmentation(main_image)
-        logger.info(f"[{self.base_dir}] Group {face_idx}: Detected {len(detected_masks)} objects.")
-        
-        final_masks = []
-        signface_images = None 
-
-        for i, mask in enumerate(detected_masks):
-            # 4. Check Fragmentation (Occlusion)
-            if self.detector.is_fragmented(mask):
-                logger.info(f"[{self.base_dir}] Group {face_idx}: Mask {i} fragmented. checking signface...")
+                # 1. Get Wide Detections (Face)
+                face_img, face_masks = self.process_face_extraction(store_path, data_name, face_idx)
                 
-                if signface_images is None:
-                    if os.path.exists(signface_folder):
-                        signface_images = ImageUtils.load_images_from_folder(signface_folder)
-                    else:
-                        signface_images = []
+                # 2. Get Baseline Detections (Signface)
+                base_img, base_masks = self.process_baseline_extraction(store_path, data_name, face_idx)
 
-                replaced = False
-                for s_img in signface_images:
-                    # 5. Wrap Image Process for Occlusion
-                    warped_s, _ = self.aligner.align_image(target_img=main_image, source_img=s_img)
+                if face_img is None: continue
+
+                # Save Baseline Crops (Step 2 requirement)
+                if base_img is not None and base_masks:
+                    for bi, bmask in enumerate(base_masks):
+                        save_p = os.path.join(det_base_dir, f"face{face_idx}_b{bi}.png")
+                        ImageUtils.save_crop(base_img, bmask, save_p)
+
+                # 3. Filter Face Masks using Baseline (Step 3 requirement)
+                valid_face_masks = []
+                
+                if base_img is not None and base_masks:
+                    # Align Baseline Image -> Face Image
+                    warped_base, H = self.aligner.align_image(face_img, base_img)
                     
-                    if warped_s is not None:
-                        # Simple overlap check
-                        warped_gray = cv2.cvtColor(warped_s, cv2.COLOR_BGR2GRAY)
-                        _, warped_mask = cv2.threshold(warped_gray, 1, 1, cv2.THRESH_BINARY)
+                    if H is not None:
+                        # Transform baseline masks to face coordinates
+                        warped_base_masks = [self.aligner.warp_mask(m, H, face_img.shape) for m in base_masks]
                         
-                        overlap = np.logical_and(mask, warped_mask)
-                        if np.count_nonzero(mask) > 0 and (np.count_nonzero(overlap) / np.count_nonzero(mask)) > 0.5:
-                            logger.info(f"[{self.base_dir}] Group {face_idx}: Occlusion fix found.")
-                            
-                            # Re-detect on warped patch
-                            new_masks = self.detector.detect_segmentation(warped_s)
-                            
-                            # Find best match
-                            best_candidate = None
-                            for candidate in new_masks:
-                                intersection = np.logical_and(mask, candidate).sum()
-                                union = np.logical_or(mask, candidate).sum()
-                                iou = intersection / union if union > 0 else 0
-                                
-                                if not self.detector.is_fragmented(candidate) and iou > 0.1:
-                                    best_candidate = candidate
-                                    break # take first good one
-                            
-                            if best_candidate is not None:
-                                final_masks.append(best_candidate)
-                                replaced = True
-                                break 
-                
-                if not replaced:
-                    final_masks.append(mask)
-            else:
-                final_masks.append(mask)
+                        # Check each face mask against any warped baseline mask
+                        for fm in face_masks:
+                            keep = False
+                            for wbm in warped_base_masks:
+                                if wbm is None: continue
+                                # Check for significant overlap
+                                iou = ImageUtils.calculate_iou(fm, wbm)
+                                # Overlap check: simply if intersection > 0 or IoU > threshold
+                                # Using simple intersection ratio here
+                                intersection = np.logical_and(fm, wbm).sum()
+                                if intersection > 0: 
+                                    keep = True
+                                    break
+                            if keep:
+                                valid_face_masks.append(fm)
+                    else:
+                        # Alignment failed, keep all or none? 
+                        # Conservative: Keep all if we can't filter
+                        valid_face_masks = face_masks
+                else:
+                    # No baseline exists (no signface folder), assume valid or skip?
+                    # Assuming we keep them if they were detected
+                    valid_face_masks = face_masks
 
-        # 7. Save Results
-        # Note: If we aligned, main_image is now warped, so result is aligned to data1
-        ImageUtils.save_results(output_folder, main_image, final_masks)
-        logger.info(f"[{self.base_dir}] Group {face_idx}: Results saved.")
+                # Save Valid Face Crops (Step 1 requirement)
+                for vi, vmask in enumerate(valid_face_masks):
+                    save_p = os.path.join(det_sign_dir, f"face{face_idx}_s{vi}.png")
+                    ImageUtils.save_crop(face_img, vmask, save_p)
+
+                # Store in memory for Pairing Step
+                detections[data_name][face_idx] = {
+                    'image': face_img,
+                    'masks': valid_face_masks
+                }
+
+        # --- B. PAIRING (Step 4 & 5) ---
+        # Pair data1 (Ref) vs data2 (Target)
+        pairs_dir_d1 = os.path.join(store_path, "pairs", "data1")
+        pairs_dir_d2 = os.path.join(store_path, "pairs", "data2")
+        ImageUtils.clear_and_create_dir(pairs_dir_d1)
+        ImageUtils.clear_and_create_dir(pairs_dir_d2)
+
+        ref_data = detections['data1']
+        tgt_data = detections['data2']
+
+        # Store candidate pairs: list of (iou, ref_crop, tgt_crop, ref_mask_area)
+        candidate_pairs = []
+
+        for face_idx in ref_data.keys():
+            if face_idx not in tgt_data: continue
+            
+            ref_entry = ref_data[face_idx]
+            tgt_entry = tgt_data[face_idx]
+            
+            # Align Target Image -> Reference Image
+            warped_tgt_img, H = self.aligner.align_image(ref_entry['image'], tgt_entry['image'])
+            
+            if H is None:
+                logger.warning(f"Could not align face{face_idx} between data1 and data2.")
+                continue
+
+            # Transform Target Masks -> Reference Coordinates
+            warped_tgt_masks = []
+            for tm in tgt_entry['masks']:
+                wm = self.aligner.warp_mask(tm, H, ref_entry['image'].shape)
+                warped_tgt_masks.append(wm)
+
+            # Compare Ref Masks vs Warped Target Masks
+            for r_i, r_mask in enumerate(ref_entry['masks']):
+                best_iou = 0
+                best_t_idx = -1
+                
+                for t_i, wt_mask in enumerate(warped_tgt_masks):
+                    if wt_mask is None: continue
+                    iou = ImageUtils.calculate_iou(r_mask, wt_mask)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_t_idx = t_i
+                
+                # Step 4: Threshold Check
+                if best_iou > IOU_THRESHOLD_PAIRING:
+                    # We have a candidate pair
+                    candidate_pairs.append({
+                        'face': face_idx,
+                        'iou': best_iou,
+                        'ref_mask': r_mask,
+                        'tgt_mask_warped': warped_tgt_masks[best_t_idx],
+                        'tgt_mask_orig': tgt_entry['masks'][best_t_idx], # For cropping original
+                        'ref_img': ref_entry['image'],
+                        'tgt_img': tgt_entry['image'], # Crop from original, not warped
+                        'id_ref': r_i,
+                        'id_tgt': best_t_idx
+                    })
+
+        # --- C. MERGE / NMS (Step 5) ---
+        # Logic: If two candidate pairs overlap significantly in the REFERENCE frame, 
+        # keep the one with higher pairing IoU (better match) or larger area.
+        
+        final_pairs = []
+        # Sort by IoU descending (prioritize best matches)
+        candidate_pairs.sort(key=lambda x: x['iou'], reverse=True)
+        
+        kept_indices = []
+        
+        for i, cand in enumerate(candidate_pairs):
+            is_duplicate = False
+            for k_idx in kept_indices:
+                existing = candidate_pairs[k_idx]
+                
+                # Check overlap between the Reference masks of the two pairs
+                overlap = ImageUtils.calculate_iou(cand['ref_mask'], existing['ref_mask'])
+                
+                # If they overlap significantly (e.g. > 0.3), it's the same sign detected twice (coarse vs fine)
+                # Since we sorted by Pairing IoU, the existing one is "better aligned"
+                if overlap > 0.3:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                kept_indices.append(i)
+                final_pairs.append(cand)
+
+        # Save Final Pairs
+        vlm_tasks = []
+
+        for idx, pair in enumerate(final_pairs):
+            pair_name = f"pair_{idx}_face{pair['face']}"
+            
+            p1_path = os.path.join(pairs_dir_d1, f"{pair_name}.png")
+            p2_path = os.path.join(pairs_dir_d2, f"{pair_name}.png")
+            
+            # Save Ref Crop
+            ImageUtils.save_crop(pair['ref_img'], pair['ref_mask'], p1_path)
+            
+            # Save Target Crop (from original Target image, using original mask)
+            ImageUtils.save_crop(pair['tgt_img'], pair['tgt_mask_orig'], p2_path)
+            
+            vlm_tasks.append((p1_path, p2_path))
+
+        logger.info(f"Store {store_name}: Saved {len(final_pairs)} aligned pairs.")
+
+        # --- D. VLM ANALYSIS (Step 6) ---
+        if vlm_tasks:
+            logger.info(f"Starting VLM Analysis for {len(vlm_tasks)} pairs...")
+            report_path = os.path.join(store_path, "VLM_Report.txt")
+            
+            with open(report_path, "w") as f:
+                f.write(f"VLM Report for {store_name}\n")
+                f.write("="*60 + "\n")
+                
+                for p1, p2 in vlm_tasks:
+                    logger.info(f"Analyzing {os.path.basename(p1)}...")
+                    result = self.vlm.analyze_pair(p1, p2)
+                    
+                    f.write(f"\nPAIR: {os.path.basename(p1)}\n")
+                    f.write("-" * 20 + "\n")
+                    f.write(result + "\n")
+                    f.write("="*60 + "\n")
+            
+            logger.info(f"VLM Report saved to {report_path}")
 
     def run(self):
-        if not self.valid: return
-        indices = [1, 2, 3, 4, 5, 6, 7, 8]
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            executor.map(self.process_single_group, indices)
+        store_paths = sorted(glob.glob(os.path.join(self.root_dir, "store*")))
+        for store in store_paths:
+            self.run_store_pipeline(store)
 
 if __name__ == "__main__":
-    print("--- Starting Nested Multi-Folder Pipeline ---")
-    
-    logger.info("Initializing SAM3 Detector (Global)...")
-    try:
-        global_detector = SAM3SignDetector(hf_token=HF_TOKEN, text_prompt=TEXT_PROMPT)
-    except Exception as e:
-        logger.error("CRITICAL: Failed to initialize global detector.")
-        raise e
-
     if not os.path.exists(ROOT_DIR):
-        logger.error(f"Root directory {ROOT_DIR} does not exist!")
+        print("Root directory not found.")
         exit(1)
-
-    # 1. Find all Store directories (e.g., photo-2/store1, photo-2/store2)
-    # pattern: ROOT_DIR/store*
-    store_paths = sorted(glob.glob(os.path.join(ROOT_DIR, "store*")))
-    
-    if not store_paths:
-        logger.warning(f"No 'store' folders found in {ROOT_DIR}")
-
-    # 2. Loop through each store
-    for store_path in store_paths:
-        store_name = os.path.basename(store_path)
-        print(f"\n#################################################")
-        print(f" PROCESSING STORE: {store_name}")
-        print(f"#################################################")
-
-        # 3. Find data folders inside this store (e.g., store1/data1, store1/data2)
-        data_paths = sorted(glob.glob(os.path.join(store_path, "data*")))
         
-        if not data_paths:
-            logger.warning(f"No 'data' folders found in {store_name}. Skipping.")
-            continue
-
-        # Track the reference folder FOR THIS SPECIFIC STORE
-        # Usually the first folder (data1) is the reference for (data2, data3) within the same store
-        current_store_ref_dir = None
-
-        for i, data_folder in enumerate(data_paths):
-            folder_name = os.path.basename(data_folder)
-            print(f"\n   >>> Sub-folder: {folder_name}")
-            
-            # Logic:
-            # The first data folder found (e.g., data1) becomes the reference for this store.
-            # Subsequent folders (data2) align to the first one.
-            
-            if i == 0:
-                processor = PipelineProcessor(data_folder, detector=global_detector, reference_base_dir=None)
-                current_store_ref_dir = data_folder # Set data1 as reference for this store
-                logger.info(f"   [Reference set to: {folder_name}]")
-            else:
-                # Pass the store's data1 as the reference base
-                processor = PipelineProcessor(data_folder, detector=global_detector, reference_base_dir=current_store_ref_dir)
-                logger.info(f"   [Aligning to reference: {os.path.basename(current_store_ref_dir)}]")
-            
-            processor.run()
-    
-    print("\nAll stores processed.")
+    pipeline = SignPipeline(ROOT_DIR)
+    pipeline.run()
