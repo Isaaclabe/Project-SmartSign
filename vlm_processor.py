@@ -119,7 +119,13 @@ class VLMProcessor:
             **3. Severity:** [No-change | Low | Medium | High]
             **4. Confidence:** [Sure | Doubt]
             """
-
+            
+            generation_config = {
+                "temperature": 0.1,  # Keep very low to force strict adherence to the "Ignore" rules
+                "top_p": 0.8,
+                "top_k": 40
+                }
+            
             safety_settings = {
                 HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
                 HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -129,8 +135,10 @@ class VLMProcessor:
 
             response = self.model.generate_content(
                 [prompt, img_ref, img_tgt],
-                safety_settings=safety_settings
+                #safety_settings=safety_settings
+                generation_config=generation_config
             )
+            
             return response.text
 
         except Exception as e:
