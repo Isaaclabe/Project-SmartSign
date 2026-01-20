@@ -11,7 +11,7 @@ from utils import ImageUtils
 from stitcher import ImageStitcher
 from aligner import ImageAligner
 from detector import SAM3SignDetector
-from vlm_processor import VLMProcessor
+from VLM_change import VLMProcessor
 
 # --- CONFIGURATION ---
 HF_TOKEN = "your_huggingface_token_here"
