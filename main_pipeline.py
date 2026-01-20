@@ -20,14 +20,16 @@ GOOGLE_API_KEY = "your_google_api_key_here"
 ROOT_DIR = "/content/Project-SmartSign/data-image"
 TEXT_PROMPT = "sign"
 IOU_THRESHOLD_PAIRING = 0.50
+DEBUG_MODE = True  # Set to True to see detailed pairing logs
 # ---------------------
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class SignPipeline:
-    def __init__(self, root_dir: str):
+    def __init__(self, root_dir: str, debug: bool = False):
         self.root_dir = root_dir
+        self.debug = debug
         self.stitcher = ImageStitcher()
         self.aligner = ImageAligner()
         
@@ -36,7 +38,7 @@ class SignPipeline:
             self.detector = SAM3SignDetector(hf_token=HF_TOKEN, text_prompt=TEXT_PROMPT)
         except Exception as e:
             logger.error(f"Failed to init SAM3: {e}")
-            raise e
+            # raise e # Commented out to allow debugging other parts if needed
 
         self.vlm = VLMProcessor(api_key=GOOGLE_API_KEY)
 
@@ -104,11 +106,11 @@ class SignPipeline:
             fig.suptitle(f"Pair {i+1} (Face {pair['face']})", fontsize=14)
             
             axes[0].imshow(img1)
-            axes[0].set_title("Reference (Data1)")
+            axes[0].set_title(f"Ref: {os.path.basename(path_ref)}")
             axes[0].axis('off')
             
             axes[1].imshow(img2)
-            axes[1].set_title("Target (Data2)")
+            axes[1].set_title(f"Tgt: {os.path.basename(path_tgt)}")
             axes[1].axis('off')
             
             plt.tight_layout()
@@ -175,12 +177,19 @@ class SignPipeline:
                 else:
                     valid_face_masks = face_masks
 
-                # Save Valid Signs
+                # Save Valid Signs and track filenames
+                crop_filenames = []
                 for vi, vmask in enumerate(valid_face_masks):
-                    save_p = os.path.join(det_sign_dir, f"face{face_idx}_s{vi}.png")
+                    fname = f"face{face_idx}_s{vi}.png"
+                    save_p = os.path.join(det_sign_dir, fname)
                     ImageUtils.save_crop(face_img, vmask, save_p)
+                    crop_filenames.append(fname)
 
-                detections[data_name][face_idx] = {'image': face_img, 'masks': valid_face_masks}
+                detections[data_name][face_idx] = {
+                    'image': face_img, 
+                    'masks': valid_face_masks,
+                    'filenames': crop_filenames
+                }
 
         # --- STEP 4 & 5: Pairing & Merging ---
         print("  > Pairing Data1 vs Data2...")
@@ -194,40 +203,72 @@ class SignPipeline:
         candidate_pairs = []
 
         for face_idx in ref_data.keys():
-            if face_idx not in tgt_data: continue
+            if face_idx not in tgt_data:
+                if self.debug:
+                    print(f"    [DEBUG] Face {face_idx}: Present in Data1 but missing in Data2. Skipping.")
+                continue
             
             ref_entry = ref_data[face_idx]
             tgt_entry = tgt_data[face_idx]
             
+            if self.debug:
+                print(f"    [DEBUG] Face {face_idx}: Attempting alignment...")
+
             warped_tgt_img, H = self.aligner.align_image(ref_entry['image'], tgt_entry['image'])
-            if H is None: continue
+            
+            if H is None:
+                if self.debug:
+                    print(f"    [DEBUG] Face {face_idx}: Alignment FAILED (Not enough matches).")
+                continue
 
             warped_tgt_masks = []
             for tm in tgt_entry['masks']:
                 wm = self.aligner.warp_mask(tm, H, ref_entry['image'].shape)
                 warped_tgt_masks.append(wm)
 
+            # Compare Masks
             for r_i, r_mask in enumerate(ref_entry['masks']):
+                ref_name = ref_entry['filenames'][r_i]
                 best_iou = 0
                 best_t_idx = -1
+                best_t_name = "None"
+                
                 for t_i, wt_mask in enumerate(warped_tgt_masks):
                     if wt_mask is None: continue
+                    tgt_name = tgt_entry['filenames'][t_i]
+                    
                     iou = ImageUtils.calculate_iou(r_mask, wt_mask)
+                    
+                    if self.debug and iou > 0.1:
+                        print(f"    [DEBUG] Face {face_idx}: {ref_name} vs {tgt_name} -> IoU: {iou:.4f}")
+                        
                     if iou > best_iou:
                         best_iou = iou
                         best_t_idx = t_i
+                        best_t_name = tgt_name
                 
                 if best_iou > IOU_THRESHOLD_PAIRING:
+                    if self.debug:
+                        print(f"    [DEBUG] Face {face_idx}: MATCH FOUND! {ref_name} paired with {best_t_name} (IoU: {best_iou:.4f})")
+                        
                     candidate_pairs.append({
                         'face': face_idx,
                         'iou': best_iou,
                         'ref_mask': r_mask,
                         'tgt_mask_orig': tgt_entry['masks'][best_t_idx],
                         'ref_img': ref_entry['image'],
-                        'tgt_img': tgt_entry['image']
+                        'tgt_img': tgt_entry['image'],
+                        'ref_fname': ref_name,
+                        'tgt_fname': best_t_name
                     })
+                else:
+                    if self.debug:
+                        print(f"    [DEBUG] Face {face_idx}: {ref_name} discarded. Best IoU {best_iou:.4f} < Threshold {IOU_THRESHOLD_PAIRING}")
 
         # NMS / Merge Duplicates
+        if self.debug:
+            print(f"    [DEBUG] Starting Merge/NMS on {len(candidate_pairs)} candidates...")
+            
         final_pairs_meta = []
         candidate_pairs.sort(key=lambda x: x['iou'], reverse=True)
         kept_indices = []
@@ -237,17 +278,26 @@ class SignPipeline:
             for k_idx in kept_indices:
                 existing = candidate_pairs[k_idx]
                 overlap = ImageUtils.calculate_iou(cand['ref_mask'], existing['ref_mask'])
+                
                 if overlap > 0.3:
                     is_duplicate = True
+                    if self.debug:
+                        print(f"    [DEBUG] Dropping Duplicate: {cand['ref_fname']} (IoU {cand['iou']:.2f}) overlaps {overlap:.2f} with kept pair {existing['ref_fname']}.")
                     break
+            
             if not is_duplicate:
                 kept_indices.append(i)
                 final_pairs_meta.append(cand)
+                if self.debug:
+                    print(f"    [DEBUG] Keeping: {cand['ref_fname']} (IoU {cand['iou']:.4f})")
 
         # Save Final Pairs
         vlm_tasks = []
         for idx, pair in enumerate(final_pairs_meta):
-            pair_name = f"pair_{idx}_face{pair['face']}"
+            # Construct meaningful pair name
+            # pair_X_faceY_refZ.png
+            pair_name = f"pair_{idx}_{pair['ref_fname'].replace('.png','')}"
+            
             p1_path = os.path.join(pairs_dir_d1, f"{pair_name}.png")
             p2_path = os.path.join(pairs_dir_d2, f"{pair_name}.png")
             
@@ -273,7 +323,7 @@ class SignPipeline:
                 f.write("="*60 + "\n")
                 
                 for task in vlm_tasks:
-                    print(f"    - Analyzing Pair Face {task['face']}...")
+                    print(f"    - Analyzing Pair Face {task['face']} ({os.path.basename(task['path_ref'])})...")
                     res = self.vlm.analyze_pair(task['path_ref'], task['path_tgt'])
                     results_text.append(res)
                     
@@ -302,5 +352,5 @@ if __name__ == "__main__":
         print(f"Root directory {ROOT_DIR} not found.")
         exit(1)
         
-    pipeline = SignPipeline(ROOT_DIR)
+    pipeline = SignPipeline(ROOT_DIR, debug=DEBUG_MODE)
     pipeline.run()
