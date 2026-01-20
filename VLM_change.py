@@ -4,166 +4,156 @@ import time
 import PIL.Image
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
+import logging
 
-# --- CONFIGURATION ---
-# PASTE YOUR KEY HERE (keep the quotes)
-# Get one for free at: https://aistudio.google.com/app/apikey
-GOOGLE_API_KEY = "your_google_api_key_here" 
+logger = logging.getLogger(__name__)
 
-def configure_genai():
-    """Configures the Gemini API using Env Var or Hardcoded Key."""
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    
-    # Fallback to hardcoded key if env var is missing
-    if not api_key:
-        if GOOGLE_API_KEY != "YOUR_GOOGLE_API_KEY_HERE":
-            api_key = GOOGLE_API_KEY
-    
-    if not api_key:
-        print("\n" + "="*50)
-        print("CRITICAL ERROR: API Key Missing")
-        print("="*50)
-        print("1. Open this file (vlm_analysis.py).")
-        print("2. Find the line: GOOGLE_API_KEY = \"YOUR_GOOGLE_API_KEY_HERE\"")
-        print("3. Replace the text inside quotes with your actual API key.")
-        print("="*50 + "\n")
-        return False
+class VLMProcessor:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.configured = False
+        self._configure()
+        self.model = None
+
+    def _configure(self):
+        if not self.api_key:
+            logger.error("API Key missing for VLM.")
+            return
+        genai.configure(api_key=self.api_key)
+        self.configured = True
+        self.model_name = self._get_best_model()
+        if self.model_name:
+            self.model = genai.GenerativeModel(self.model_name)
+
+    def _get_best_model(self):
+        """Dynamically finds a working Vision-Language Model."""
+        try:
+            models = list(genai.list_models())
+            model_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+            
+            priorities = [
+                "models/gemini-2.5-flash",
+                "models/gemini-2.0-flash-exp",
+                "models/gemini-1.5-flash", 
+                "models/gemini-1.5-pro",
+            ]
+
+            for p in priorities:
+                if p in model_names:
+                    logger.info(f"VLM Selected: {p}")
+                    return p
+            
+            # Fallback
+            if model_names:
+                return model_names[0]
+            return None
+        except Exception as e:
+            logger.error(f"Error listing VLM models: {e}")
+            return "models/gemini-1.5-flash" # Blind fallback
+
+    def resize_image_smart(self, pil_image, max_side=1024):
+        width, height = pil_image.size
+        if max(width, height) <= max_side:
+            return pil_image
+        ratio = max_side / max(width, height)
+        return pil_image.resize((int(width * ratio), int(height * ratio)), PIL.Image.Resampling.LANCZOS)
+
+    def analyze_pair(self, ref_path: str, tgt_path: str) -> str:
+        """
+        Analyzes a pair of images (reference and target) for physical changes.
+        """
+        if not self.model:
+            return "Error: VLM Model not initialized."
+
+        try:
+            img_ref = PIL.Image.open(ref_path)
+            img_tgt = PIL.Image.open(tgt_path)
+
+            img_ref = self.resize_image_smart(img_ref)
+            img_tgt = self.resize_image_smart(img_tgt)
+
+            prompt = """
+            ### Role
+            You are a forensic image analyst. Compare Image 1 (Reference) to Image 2 (Target) to detect physical modifications to the signage.
+
+            ### Context
+            - **Image 1:** Original Reference.
+            - **Image 2:** Current State.
+            - **Note:** Images are crops that may have slight alignment artifacts. Ignore warp distortions.
+
+            ### Detection Checklist
+            Evaluate for **PHYSICAL** changes only:
+            1.  **Text Content:** Missing/Added text, changed numbers, graffiti.
+            2.  **Shape & Structure:** Dents, bends, broken parts.
+            3.  **Logo/Icons:** Missing, covered, or altered symbols.
+            4.  **Color:** Repainting or severe bleaching (Ignore lighting/shadows).
+
+            ### Output Format
+            Provide your analysis in this exact format:
+            **1. Summary:** [One sentence]
+            **2. Changes:**
+            * [Change 1 or "None"]
+            * [Change 2 or "None"]
+            **3. Severity:** [No-change | Low | Medium | High]
+            **4. Confidence:** [Sure | Doubt]
+            """
+            # prompt = """
+            # ### Role
+            # You are a forensic image analyst. Compare Image 1 (Reference) to Image 2 (Target) to detect physical modifications to the signage.
         
-    genai.configure(api_key=api_key)
-    return True
-
-def get_best_model():
-    """
-    Dynamically finds a working Vision-Language Model (VLM).
-    Prioritizes Flash (Nano/Fast) -> Pro -> Legacy Vision.
-    """
-    print("Checking available models...")
-    try:
-        models = list(genai.list_models())
-        model_names = [m.name for m in models if 'generateContent' in m.supported_generation_methods]
+            # ### Context
+            # - **Image 1:** Original Reference.
+            # - **Image 2:** Current State.
+            # - **Wrap Warning:** Images are digitally warped. You MUST IGNORE "stretching," "skew," or "blur" caused by the warp process.
+            # - **Segmentation Warning:** Images are crop from segmented part, so uou MUST take into account that sometimes the sign detection didn't crop them exactly the same way. Or may have bad segmentation.
         
-        # Priority list
-        priorities = [
-            "models/gemini-1.5-flash",
-            "models/gemini-1.5-flash-latest",
-            "models/gemini-1.5-flash-001",
-            "models/gemini-1.5-pro",
-            "models/gemini-pro-vision"
-        ]
+            # ### Detection Checklist
+            # Evaluate the following 4 distinct categories. For each, determine if a **PHYSICAL** change occurred.
         
-        for p in priorities:
-            if p in model_names:
-                print(f"   -> Selected Model: {p}")
-                return p
+            # 1.  **Text Content:**
+            #     - Check for missing letters, added graffiti text, or changed numbers.
+            #     - Ignore text sharpness or pixelation.
         
-        # Fallback
-        for m in model_names:
-            if 'flash' in m or 'vision' in m:
-                print(f"   -> Selected Fallback Model: {m}")
-                return m
-
-        print("ERROR: No suitable VLM model found in your account.")
-        return None
-
-    except Exception as e:
-        print(f"Error listing models: {e}")
-        return "models/gemini-1.5-flash"
-
-def find_images(folder, face_id="face1"):
-    """Locates the crop/result image in the data folders."""
-    if not os.path.exists(folder):
-        print(f"Warning: Folder {folder} does not exist.")
-        return None
-
-    search_paths = [
-        os.path.join(folder, f"{face_id}_signs"),
-        os.path.join(folder, f"{face_id}_sign")
-    ]
-    for p in search_paths:
-        if os.path.exists(p):
-            files = glob.glob(os.path.join(p, "*.png")) + glob.glob(os.path.join(p, "*.jpg"))
-            # Sort to ensure deterministic selection if multiple exist
-            files.sort()
-            if files: return files[0]
-    return None
-
-def analyze_changes_with_vlm(ref_path, tgt_path):
-    model_name = get_best_model()
-    if not model_name:
-        return "Could not initialize model."
-
-    print(f"Initializing {model_name}...")
-    model = genai.GenerativeModel(model_name)
-
-    print("Uploading images...")
-    img_ref = PIL.Image.open(ref_path)
-    img_tgt = PIL.Image.open(tgt_path)
-
-    prompt = """
-    You are a forensic image analyst. 
-    Image 1 is the REFERENCE (original state).
-    Image 2 is the TARGET (current state).
-
-    Compare them and identify specific changes in the sign. Focus on:
-    1. Text content differences.
-    2. Shape change.
-    3. Texture or logo change.
-    4. Color change (not color fading).
-
-    and assume that there are not both esspecially taken from the same point of view (but there are wrapped to appear), 
-    and not the same lighting conditions.
-
-    Output format:
-    - Summary: [One sentence summary]
-    - Detected Changes: [List of bullet points]
-    - Severity: [No-change/Low/Medium/High]
-    - Coonfidence [Sure/Doubt/Not-sure]
-    """
-
-    print("Sending request to Google API...")
-    try:
-        safety_settings = {
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-        }
-
-        response = model.generate_content(
-            [prompt, img_ref, img_tgt],
-            safety_settings=safety_settings
-        )
-        return response.text
-    except Exception as e:
-        return f"API Error: {e}"
-
-if __name__ == "__main__":
-    if not configure_genai():
-        exit()
-
-    # 1. Locate Images
-    print("Locating images in ./data1 and ./data2...")
-    path_ref = find_images("/content/Project-SmartSign/data1", "face1")
-    path_tgt = find_images("/content/Project-SmartSign/data2", "face1")
-
-    if not path_ref or not path_tgt:
-        print(f"Error: Could not find images.\nRef: {path_ref}\nTgt: {path_tgt}")
-        print("Make sure you ran the main_pipeline.py first.")
-    else:
-        print(f"Reference: {path_ref}")
-        print(f"Target:    {path_tgt}")
+            # 2.  **Shape & Structure:**
+            #     - Look for: Dents, bent metal, broken corners, or holes.
+            #     - **CRITICAL:** Do NOT report perspective distortion or trapezoidal shapes and normal signs of aging (weathering, scratches) as a change. ONLY report physical deformation of the material. 
+            
+            # 3.  **Logo & Iconography:**
+            #     - Check if the logo/symbol is missing, covered (sticker/graffiti), or scraped off.
+            #     - Check if the icon type has changed (e.g., "Left Arrow" became "Right Arrow").
         
-        # Check for user error (comparing same image)
-        if os.path.abspath(path_ref) == os.path.abspath(path_tgt):
-            print("\nWARNING: Reference and Target paths are IDENTICAL.")
-            print("The model will not find any changes because you are comparing the image to itself.")
-            print("Check that ./data2 contains different images than ./data1.\n")
+            # 4.  **Color:**
+            #     - Look for: Complete repainting (e.g., Red sign became Blue) or severe bleaching.
+            #     - **CRITICAL:** Do NOT report "darker" or "lighter" tones caused by shadows, sun glare, camera white balance, color fainting, or different lighting conditions.
         
-        print("-" * 40)
+            # ### Output Format
+            # Provide your analysis in this exact format:
         
-        # 2. Run Analysis
-        analysis = analyze_changes_with_vlm(path_ref, path_tgt)
+            # **1. Summary:** [One sentence summary]
         
-        print("\n--- VLM FORENSIC REPORT ---")
-        print(analysis)
-        print("---------------------------")
+            # **2. Detailed Changes:**
+            # * **Text:** [No Change / Change Detected: description]
+            # * **Shape:** [No Change / Change Detected: description]
+            # * **Logo:** [No Change / Change Detected: description]
+            # * **Color:** [No Change / Change Detected: description]
+        
+            # **3. Severity:** [No-change | Low (Cosmetic) | Medium (Readable but damaged) | High (Meaning altered/destroyed)]
+            # **4. Confidence:** [Sure | Doubt | Not-sure]
+            # """
+
+            generation_config = {
+                "temperature": 0.1,  # Keep very low to force strict adherence to the "Ignore" rules
+                "top_p": 0.8,
+                "top_k": 40
+                }
+
+            response = self.model.generate_content(
+                [prompt, img_ref, img_tgt],
+                #safety_settings=safety_settings
+                generation_config=generation_config
+            )
+            return response.text
+
+        except Exception as e:
+            logger.error(f"VLM Analysis Failed: {e}")
+            return f"Analysis Error: {e}"
